@@ -180,6 +180,30 @@ def milestone_3():
     return summarize
 
 # Milestone 4: Evaluate the quality of generated summaries against original feedback.
-
+def compute_rouge1(reference, hypothesis):
+    """Computes a simple unigram ROUGE-1 F1 score (no external libraries)."""
+    ref_tokens = set(reference.lower().split())
+    hyp_tokens = set(hypothesis.lower().split())
+    if not hyp_tokens or not ref_tokens:
+        return 0.0
+    overlap = ref_tokens & hyp_tokens
+    precision = len(overlap) / len(hyp_tokens)
+    recall = len(overlap) / len(ref_tokens)
+    if precision + recall == 0:
+        return 0.0
+    f1 = 2 * precision * recall / (precision + recall)
+    return round(f1, 4)
+def milestone_4():
+    """Evaluates summary quality using ROUGE-1 F1 on the dataset."""
+    trained = milestone_2()
+    model = trained["model"]
+    tokenizer = trained["tokenizer"]
+    scores = []
+    for item in FEEDBACK_DATA[:6]:
+        generated = summarize(model, tokenizer, item["feedback"])
+        score = compute_rouge1(item["summary"], generated)
+        scores.append(score)
+    avg_rouge = sum(scores) / len(scores)
+    return {"rouge1_scores": scores, "avg_rouge1": avg_rouge}
 
 # Milestone 5: Implement adapter merging for inference.
