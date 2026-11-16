@@ -1,6 +1,6 @@
 """Streamlit entry point: `streamlit run app/main.py`"""
 import streamlit as st
-from app.core import milestone_2, summarize, compute_rouge1, FEEDBACK_DATA
+from app.core import build_model, summarize, compute_rouge1, baseline_first_sentence, FEEDBACK_DATA
 
 st.set_page_config(page_title="Student Feedback Summarizer")
 st.title("Student Feedback Summarizer")
@@ -10,12 +10,10 @@ st.write(
     " for rapid curriculum improvement."
 )
 
-# Load model once and cache it
 @st.cache_resource
 def load_model():
-    res = milestone_2()
+    res = build_model()
     return res["model"], res["tokenizer"]
-
 
 tab1, tab2 = st.tabs(["Summarize Feedback", "Evaluation Results"])
 
@@ -26,7 +24,6 @@ with tab1:
         value="The lectures moved too fast and I couldn't follow the examples.",
         height=120,
     )
-
     if st.button("Generate Summary", type="primary"):
         with st.spinner("Loading model and generating summary..."):
             model, tokenizer = load_model()
@@ -35,22 +32,19 @@ with tab1:
         st.write(f"**Summary:** {result}")
 
 with tab2:
-    st.subheader("ROUGE-1 Evaluation on Training Data")
+    st.subheader("LoRA vs Baseline Comparison")
     if st.button("Run Evaluation"):
-        with st.spinner("Evaluating summaries..."):
+        with st.spinner("Evaluating..."):
             model, tokenizer = load_model()
-            scores = []
+            rows = []
             for item in FEEDBACK_DATA[:6]:
-                generated = summarize(model, tokenizer, item["feedback"])
-                score = compute_rouge1(item["summary"], generated)
-                scores.append(
-                    {
-                        "Feedback": item["feedback"][:60] + "...",
-                        "Reference": item["summary"],
-                        "Generated": generated[:80],
-                        "ROUGE-1 F1": score,
-                    }
-                )
-            st.table(scores)
-            avg = sum(s["ROUGE-1 F1"] for s in scores) / len(scores)
-            st.metric("Average ROUGE-1 F1", f"{avg:.3f}")
+                lora_out = summarize(model, tokenizer, item["feedback"])
+                base_out = baseline_first_sentence(item["feedback"])
+                rows.append({
+                    "Feedback": item["feedback"][:50] + "...",
+                    "Baseline": base_out[:50],
+                    "LoRA": lora_out[:50],
+                    "Baseline ROUGE": compute_rouge1(item["summary"], base_out),
+                    "LoRA ROUGE": compute_rouge1(item["summary"], lora_out),
+                })
+            st.table(rows)

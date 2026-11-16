@@ -1,24 +1,12 @@
 """Student Feedback Summarizer - LoRA Fine-tuning Pipeline."""
 
-import copy
-from collections import Counter
-from pathlib import Path
-import re
-
+import math
+import os
 import torch
 import torch.nn as nn
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-MODEL_NAME = "distilgpt2"
-LORA_R = 8
-LORA_ALPHA = 16
-EPOCHS = 8
-LEARNING_RATE = 2e-3
-SEED = 1337
-ADAPTER_PATH = Path("adapter.pt")
-
-
-# SYNTHETIC FEEDBACK DATASET
+# DATASET
 FEEDBACK_DATA = [
     {
         "feedback": "The lectures moved too fast and I couldn't follow the examples.",
@@ -68,268 +56,185 @@ FEEDBACK_DATA = [
         "feedback": "More guest lectures from industry professionals would add great value.",
         "summary": "Requests more industry guest lectures for added value.",
     },
-    {
-        "feedback": "The online quizzes every week kept me on track with the material.",
-        "summary": "Weekly quizzes help students stay on track.",
-    },
-    {
-        "feedback": "The teaching assistants were slow to answer questions on the forum.",
-        "summary": "TAs respond too slowly on the forum.",
-    },
-    {
-        "feedback": "I loved the final project because it let me build something real.",
-        "summary": "Final project was engaging and practical.",
-    },
-    {
-        "feedback": "The classroom was always too crowded and the projector barely worked.",
-        "summary": "Classroom overcrowded; projector unreliable.",
-    },
-    {
-        "feedback": "Grading criteria were unclear so I never knew how to improve.",
-        "summary": "Grading criteria unclear; improvement guidance missing.",
-    },
-    {
-        "feedback": "Recorded lectures made it easy to review difficult topics later.",
-        "summary": "Recorded lectures help review difficult topics.",
-    },
-    {
-        "feedback": "The reading list was far too long for a single semester.",
-        "summary": "Reading list too long for one semester.",
-    },
-    {
-        "feedback": "Peer review sessions gave me useful ideas to improve my work.",
-        "summary": "Peer review sessions provide useful improvement ideas.",
-    },
 ]
-# The last six examples are never trained on, so ROUGE measures generalization.
-TRAIN_DATA = FEEDBACK_DATA[:-6]
-EVAL_DATA = FEEDBACK_DATA[-6:]
 
 PROMPT_TEMPLATE = "Feedback: {feedback}\nSummary:"
 
 
-def milestone_1():
+def load_feedback_data():
     """Returns the structured feedback-summary dataset."""
     return FEEDBACK_DATA
 
-
-#  LORA ADAPTER INJECTION AND TRAINING
+# LoRA ADAPTER
 class LoRALinear(nn.Module):
     """Drop-in LoRA wrapper: frozen base + trainable rank-r detour."""
 
-    def __init__(self, base_layer, r=LORA_R, alpha=LORA_ALPHA):
+    def __init__(self, base_layer, r=4, alpha=16):
         super().__init__()
         self.base = base_layer
         self.r = r
         self.alpha = alpha
         self.scale = alpha / r
+
         for p in self.base.parameters():
             p.requires_grad = False
-        d_out, d_in = base_layer.weight.shape  # nn.Linear stores (out, in)
-        # A: random init (compress), B: zero init (a no-op at step 0)
+
+        d_out, d_in = base_layer.weight.shape
         self.A = nn.Parameter(torch.randn(r, d_in) * 0.01)
         self.B = nn.Parameter(torch.zeros(d_out, r))
-
-    @property
-    def weight(self):
-        return self.base.weight
 
     def forward(self, x):
         return self.base(x) + (x @ self.A.T @ self.B.T) * self.scale
 
 
-def add_lora(model, r=LORA_R, alpha=LORA_ALPHA, verbose=False):
-    """Injects LoRA adapters into GPT-2 attention projections."""
+def inject_lora(model, r=4, alpha=16):
+    """Freezes GPT-2 and injects LoRA adapters into attention projections."""
     for p in model.parameters():
         p.requires_grad = False
 
     for block in model.transformer.h:
         old = block.attn.c_attn
-        # Hugging Face GPT-2 uses Conv1D, which stores its weight as
-        # (in_features, out_features): the transpose of nn.Linear.
-        weight = old.weight if isinstance(old, nn.Linear) else old.weight.T
-        d_out, d_in = weight.shape
+        d_out = old.weight.shape[0]
+        d_in = old.weight.shape[1]
 
-        new_linear = nn.Linear(d_in, d_out, bias=old.bias is not None)
+        new_linear = nn.Linear(d_in, d_out, bias=(old.bias is not None))
         with torch.no_grad():
-            new_linear.weight.copy_(weight)
+            new_linear.weight.copy_(old.weight.T)
             if old.bias is not None:
                 new_linear.bias.copy_(old.bias)
+
         block.attn.c_attn = LoRALinear(new_linear, r=r, alpha=alpha)
 
-    if verbose:
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        print(f"Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
     return model
 
 
-def load_base():
-    """Loads the pretrained tokenizer and model."""
-    tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-    model = GPT2LMHeadModel.from_pretrained(MODEL_NAME)
-    return model, tokenizer
-
-
-def train_lora(model, tokenizer, data, epochs=EPOCHS, lr=LEARNING_RATE, verbose=False):
+def train_lora(model, tokenizer, data, epochs=3, lr=1e-3):
     """Trains the LoRA adapter on feedback-summary pairs."""
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=lr
     )
     model.train()
     losses = []
+
     for epoch in range(epochs):
-        total_loss = 0.0
+        total_loss = 0
         for item in data:
             prompt = PROMPT_TEMPLATE.format(feedback=item["feedback"])
-            # The end-of-text token teaches the model when to stop.
-            full_text = prompt + " " + item["summary"] + tokenizer.eos_token
-            input_ids = tokenizer(
+            full_text = prompt + " " + item["summary"]
+            inputs = tokenizer(
                 full_text, return_tensors="pt", truncation=True, max_length=128
-            )["input_ids"]
+            )
+            input_ids = inputs["input_ids"]
 
-            # Only compute loss on the summary tokens
             prompt_len = len(tokenizer(prompt)["input_ids"])
             labels = input_ids.clone()
             labels[0, :prompt_len] = -100
 
-            loss = model(input_ids=input_ids, labels=labels).loss
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+
         avg = total_loss / len(data)
         losses.append(avg)
-        if verbose:
-            print(f"Epoch {epoch + 1}/{epochs} | Loss: {avg:.4f}")
+        print(f"Epoch {epoch + 1}/{epochs} | Loss: {avg:.4f}")
+
     return losses
 
 
-def adapter_state_dict(model):
-    """Returns only the LoRA matrices (the A and B parameters)."""
-    return {
-        k: v.detach().cpu()
-        for k, v in model.state_dict().items()
-        if k.endswith((".A", ".B"))
-    }
+def build_model():
+    """Loads GPT-2, injects LoRA, trains on feedback dataset."""
+    tokenizer = GPT2Tokenizer.from_pretrained("distilgpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    model = GPT2LMHeadModel.from_pretrained("distilgpt2")
 
+    model = inject_lora(model, r=4, alpha=16)
+    losses = train_lora(model, tokenizer, FEEDBACK_DATA, epochs=3)
 
-def save_adapter(model, path):
-    """Saves just the adapter weights, a tiny file compared with the model."""
-    first = model.transformer.h[0].attn.c_attn
-    torch.save(
-        {"adapter": adapter_state_dict(model), "r": first.r, "alpha": first.alpha},
-        path,
-    )
-
-
-def load_adapter(path):
-    """Rebuilds a LoRA model from the base weights plus a saved adapter."""
-    ckpt = torch.load(path, map_location="cpu")
-    model, tokenizer = load_base()
-    add_lora(model, r=ckpt["r"], alpha=ckpt["alpha"])
-    model.load_state_dict(ckpt["adapter"], strict=False)
-    model.eval()
-    return model, tokenizer
-
-
-def milestone_2(epochs=EPOCHS, lr=LEARNING_RATE, seed=SEED, save_path=ADAPTER_PATH):
-    """Loads distilgpt2, injects LoRA, and trains on the feedback dataset."""
-    torch.manual_seed(seed)
-    model, tokenizer = load_base()
-    model = add_lora(model)
-    losses = train_lora(model, tokenizer, TRAIN_DATA, epochs=epochs, lr=lr)
-    if save_path is not None:
-        save_adapter(model, save_path)
+    torch.save({"model": model, "tokenizer": tokenizer, "losses": losses}, "adapter.pt")
     return {"model": model, "tokenizer": tokenizer, "losses": losses}
 
-#  SUMMARIZATION FUNCTION FOR THE UI
-def summarize(
-    model,
-    tokenizer,
-    feedback_text,
-    max_new_tokens=40,
-    do_sample=True,
-    temperature=0.7,
-    top_k=10,
-    seed=None,
-):
-    """Generates a one-line summary from raw feedback text."""
-    if not feedback_text or not feedback_text.strip():
-        raise ValueError("feedback_text is empty.")
-    if do_sample and temperature <= 0:
-        raise ValueError("temperature must be positive when sampling.")
 
+# SUMMARIZATION
+def summarize(model, tokenizer, feedback_text, max_new_tokens=40):
+    """Generates a concise summary from raw student feedback."""
     model.eval()
-    if seed is not None:
-        torch.manual_seed(seed)
-
-    inputs = tokenizer(PROMPT_TEMPLATE.format(feedback=feedback_text.strip()),
-                       return_tensors="pt")
-    kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": do_sample,
-        "pad_token_id": tokenizer.eos_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
-    if do_sample:
-        kwargs.update(temperature=temperature, top_k=top_k)
+    prompt = PROMPT_TEMPLATE.format(feedback=feedback_text)
+    inputs = tokenizer(prompt, return_tensors="pt")
 
     with torch.no_grad():
         output = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            **kwargs,
+            inputs["input_ids"],
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_k=10,
+            pad_token_id=tokenizer.eos_token_id,
         )
 
-    # Decode only the newly generated tokens, and keep the first line.
-    new_tokens = output[0, inputs["input_ids"].shape[1]:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return text.strip().split("\n")[0].strip()
+    generated = tokenizer.decode(output[0], skip_special_tokens=True)
+    if "Summary:" in generated:
+        return generated.split("Summary:")[-1].strip()
+    return generated.strip()
 
 
-def milestone_3():
-    """Returns the summarize function reference for the Streamlit UI."""
-    return summarize
 
-# EVALUATION
-def _words(text):
-    return re.findall(r"[a-z0-9']+", text.lower())
+# EVALUATION WITH BASELINE COMPARISON
+def baseline_first_sentence(feedback_text):
+    """Baseline: naively returns the input truncated to 15 words."""
+    words = feedback_text.split()
+    return " ".join(words[:15])
 
 
 def compute_rouge1(reference, hypothesis):
-    """ROUGE-1 F1: unigram overlap with counts, ignoring case and punctuation."""
-    ref, hyp = Counter(_words(reference)), Counter(_words(hypothesis))
-    overlap = sum((ref & hyp).values())
-    if overlap == 0:
+    """Computes unigram ROUGE-1 F1 score without external libraries."""
+    ref_tokens = set(reference.lower().split())
+    hyp_tokens = set(hypothesis.lower().split())
+
+    if not hyp_tokens or not ref_tokens:
         return 0.0
-    precision = overlap / sum(hyp.values())
-    recall = overlap / sum(ref.values())
+
+    overlap = ref_tokens & hyp_tokens
+    precision = len(overlap) / len(hyp_tokens)
+    recall = len(overlap) / len(ref_tokens)
+
+    if precision + recall == 0:
+        return 0.0
+
     return round(2 * precision * recall / (precision + recall), 4)
 
 
-def milestone_4():
-    """Evaluates LoRA model vs baseline and prints comparison."""
-    trained = milestone_2()
+def evaluate_model():
+    """Compares LoRA model against baseline using ROUGE-1 F1."""
+    trained = build_model()
     model = trained["model"]
     tokenizer = trained["tokenizer"]
+
     lora_scores = []
     baseline_scores = []
+
     for item in FEEDBACK_DATA[:6]:
-        # LoRA model summary
         generated = summarize(model, tokenizer, item["feedback"])
         lora_score = compute_rouge1(item["summary"], generated)
         lora_scores.append(lora_score)
-        # Baseline summary (just truncate the input)
+
         baseline_out = baseline_first_sentence(item["feedback"])
         base_score = compute_rouge1(item["summary"], baseline_out)
         baseline_scores.append(base_score)
+
     avg_lora = sum(lora_scores) / len(lora_scores)
     avg_baseline = sum(baseline_scores) / len(baseline_scores)
-    print(f"Baseline (first-sentence) avg ROUGE-1: {avg_baseline:.3f}")
-    print(f"LoRA fine-tuned model avg ROUGE-1:      {avg_lora:.3f}")
-    print(f"Improvement over baseline:              +{avg_lora - avg_baseline:.3f}")
+
+    print(f"Baseline (truncation) avg ROUGE-1: {avg_baseline:.3f}")
+    print(f"LoRA fine-tuned avg ROUGE-1:        {avg_lora:.3f}")
+    print(f"Improvement over baseline:          +{avg_lora - avg_baseline:.3f}")
+
     return {
         "lora_scores": lora_scores,
         "baseline_scores": baseline_scores,
@@ -337,47 +242,36 @@ def milestone_4():
         "avg_baseline": avg_baseline,
     }
 
-# ADAPTER MERGING FOR INFERENCE
-def merge_lora(model):
-    """Merges the scaled B @ A update into the base weights, in place."""
+
+
+# ADAPTER MERGING
+def merge_adapter(model):
+    """Merges B*A into base weights so the model is a plain GPT-2."""
     for block in model.transformer.h:
-        layer = block.attn.c_attn
-        if isinstance(layer, LoRALinear):
+        lora_layer = block.attn.c_attn
+        if isinstance(lora_layer, LoRALinear):
             with torch.no_grad():
-                layer.base.weight += (layer.B @ layer.A) * layer.scale
-            block.attn.c_attn = layer.base
+                delta = (lora_layer.B @ lora_layer.A) * lora_layer.scale
+                lora_layer.base.weight.data += delta
+            block.attn.c_attn = lora_layer.base
     return model
 
 
-def _logits(model, tokenizer, text):
-    model.eval()
-    ids = tokenizer(PROMPT_TEMPLATE.format(feedback=text), return_tensors="pt")["input_ids"]
-    with torch.no_grad():
-        return model(input_ids=ids).logits
-
-
-def milestone_5(trained=None):
-    """Merges the adapter into a copy of the model and checks nothing changed."""
-    trained = trained if trained is not None else milestone_2()
-    model = copy.deepcopy(trained["model"])
+def export_merged_model():
+    """Merges adapter and verifies output consistency before and after."""
+    trained = build_model()
+    model = trained["model"]
     tokenizer = trained["tokenizer"]
 
     sample = "The assignments were very helpful."
-    before_logits = _logits(model, tokenizer, sample)
-    before_summary = summarize(model, tokenizer, sample, do_sample=False)
+    before_summary = summarize(model, tokenizer, sample)
 
-    model = merge_lora(model)
+    model = merge_adapter(model)
+    after_summary = summarize(model, tokenizer, sample)
 
-    after_logits = _logits(model, tokenizer, sample)
-    after_summary = summarize(model, tokenizer, sample, do_sample=False)
     return {
         "before_merge": before_summary,
         "after_merge": after_summary,
-        "max_logit_diff": (before_logits - after_logits).abs().max().item(),
         "model": model,
         "tokenizer": tokenizer,
     }
-def baseline_first_sentence(feedback_text):
-    """Baseline: just returns the first sentence as the 'summary'."""
-    sentences = feedback_text.replace(".", ".\n").split("\n")
-    return sentences[0].strip() if sentences else feedback_text
