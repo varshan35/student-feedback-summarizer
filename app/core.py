@@ -113,7 +113,7 @@ def milestone_1():
     return FEEDBACK_DATA
 
 
-# MILESTONE 2: LORA ADAPTER INJECTION AND TRAINING
+#  LORA ADAPTER INJECTION AND TRAINING
 class LoRALinear(nn.Module):
     """Drop-in LoRA wrapper: frozen base + trainable rank-r detour."""
 
@@ -244,7 +244,7 @@ def milestone_2(epochs=EPOCHS, lr=LEARNING_RATE, seed=SEED, save_path=ADAPTER_PA
         save_adapter(model, save_path)
     return {"model": model, "tokenizer": tokenizer, "losses": losses}
 
-# MILESTONE 3: SUMMARIZATION FUNCTION FOR THE UI
+#  SUMMARIZATION FUNCTION FOR THE UI
 def summarize(
     model,
     tokenizer,
@@ -293,7 +293,7 @@ def milestone_3():
     """Returns the summarize function reference for the Streamlit UI."""
     return summarize
 
-# MILESTONE 4: EVALUATION
+# EVALUATION
 def _words(text):
     return re.findall(r"[a-z0-9']+", text.lower())
 
@@ -325,7 +325,7 @@ def milestone_4(trained=None):
         "generated": generated,
     }
 
-# MILESTONE 5: ADAPTER MERGING FOR INFERENCE
+# ADAPTER MERGING FOR INFERENCE
 def merge_lora(model):
     """Merges the scaled B @ A update into the base weights, in place."""
     for block in model.transformer.h:
