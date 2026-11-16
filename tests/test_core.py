@@ -1,5 +1,6 @@
 """Tests for Student Feedback Summarizer - Milestones 1 to 5."""
 import pytest
+import torch
 from app.core import (
     milestone_1,
     milestone_2,
@@ -7,10 +8,9 @@ from app.core import (
     milestone_4,
     milestone_5,
     compute_rouge1,
+    baseline_first_sentence,
     LoRALinear,
 )
-import torch
-
 
 def test_milestone_1():
     data = milestone_1()
@@ -43,10 +43,13 @@ def test_milestone_3():
 
 def test_milestone_4():
     res = milestone_4()
-    assert "avg_rouge1" in res
-    assert isinstance(res["avg_rouge1"], float)
-    assert 0.0 <= res["avg_rouge1"] <= 1.0
-    assert len(res["rouge1_scores"]) == 6
+    assert "avg_lora" in res and "avg_baseline" in res
+    assert isinstance(res["avg_lora"], float)
+    assert isinstance(res["avg_baseline"], float)
+    assert 0.0 <= res["avg_lora"] <= 1.0
+    assert 0.0 <= res["avg_baseline"] <= 1.0
+    assert len(res["lora_scores"]) == 6
+    assert len(res["baseline_scores"]) == 6
 
 
 def test_milestone_5():

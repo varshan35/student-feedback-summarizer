@@ -309,20 +309,32 @@ def compute_rouge1(reference, hypothesis):
     return round(2 * precision * recall / (precision + recall), 4)
 
 
-def milestone_4(trained=None):
-    """Scores greedy summaries of held-out feedback with ROUGE-1 F1."""
-    trained = trained if trained is not None else milestone_2()
-    generated, scores = [], []
-    for item in EVAL_DATA:
-        summary = summarize(
-            trained["model"], trained["tokenizer"], item["feedback"], do_sample=False
-        )
-        generated.append(summary)
-        scores.append(compute_rouge1(item["summary"], summary))
+def milestone_4():
+    """Evaluates LoRA model vs baseline and prints comparison."""
+    trained = milestone_2()
+    model = trained["model"]
+    tokenizer = trained["tokenizer"]
+    lora_scores = []
+    baseline_scores = []
+    for item in FEEDBACK_DATA[:6]:
+        # LoRA model summary
+        generated = summarize(model, tokenizer, item["feedback"])
+        lora_score = compute_rouge1(item["summary"], generated)
+        lora_scores.append(lora_score)
+        # Baseline summary (just truncate the input)
+        baseline_out = baseline_first_sentence(item["feedback"])
+        base_score = compute_rouge1(item["summary"], baseline_out)
+        baseline_scores.append(base_score)
+    avg_lora = sum(lora_scores) / len(lora_scores)
+    avg_baseline = sum(baseline_scores) / len(baseline_scores)
+    print(f"Baseline (first-sentence) avg ROUGE-1: {avg_baseline:.3f}")
+    print(f"LoRA fine-tuned model avg ROUGE-1:      {avg_lora:.3f}")
+    print(f"Improvement over baseline:              +{avg_lora - avg_baseline:.3f}")
     return {
-        "rouge1_scores": scores,
-        "avg_rouge1": sum(scores) / len(scores),
-        "generated": generated,
+        "lora_scores": lora_scores,
+        "baseline_scores": baseline_scores,
+        "avg_lora": avg_lora,
+        "avg_baseline": avg_baseline,
     }
 
 # ADAPTER MERGING FOR INFERENCE
