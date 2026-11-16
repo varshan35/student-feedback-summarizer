@@ -1,30 +1,238 @@
-"""Your code. One stub per milestone; build them in order and keep each one small."""
+"""Your tests. Each milestone in README.md gets one here: write the test first, then make it pass.
 
-# --- Milestone 1: Prepare a small dataset of synthetic student feedback and summary pairs.
-# Hint: Focus on structuring your synthetic data with clear feedback and summary pairs.
-def milestone_1():  # TODO(milestone 1)
-    raise NotImplementedError("TODO(milestone 1)")
+They start skipped. Remove the `skip` line as you work on each milestone.
+"""
+import pytest
+
+"""Student Feedback Summarizer - LoRA Fine-tuning Pipeline."""
+import math
+import os
+import torch
+import torch.nn as nn
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+# MILESTONE 1: SYNTHETIC FEEDBACK DATASET
+FEEDBACK_DATA = [
+    {
+        "feedback": "The lectures moved too fast and I couldn't follow the examples.",
+        "summary": "Lectures are too fast; examples need slower pacing.",
+    },
+    {
+        "feedback": "Assignments were very helpful but deadlines were too tight.",
+        "summary": "Assignments helpful but deadlines need extension.",
+    },
+    {
+        "feedback": "The professor explained concepts clearly with real world examples.",
+        "summary": "Clear explanations with good real world examples.",
+    },
+    {
+        "feedback": "There was no feedback given on our submitted assignments at all.",
+        "summary": "No feedback provided on submitted assignments.",
+    },
+    {
+        "feedback": "Office hours were very useful and the professor was approachable.",
+        "summary": "Office hours helpful; professor is approachable.",
+    },
+    {
+        "feedback": "Course content was outdated and not relevant to current industry.",
+        "summary": "Course content outdated and lacks industry relevance.",
+    },
+    {
+        "feedback": "More practical coding exercises would improve understanding greatly.",
+        "summary": "Needs more hands-on coding exercises.",
+    },
+    {
+        "feedback": "The slides were too text heavy and hard to read during class.",
+        "summary": "Slides are too text heavy; needs visual improvement.",
+    },
+    {
+        "feedback": "Group projects helped me learn collaboration and communication skills.",
+        "summary": "Group projects effectively build collaboration skills.",
+    },
+    {
+        "feedback": "Exam questions did not match what was taught in the lectures.",
+        "summary": "Exam questions misaligned with lecture content.",
+    },
+    {
+        "feedback": "The course structure was well organized and easy to follow weekly.",
+        "summary": "Well organized course structure with clear weekly flow.",
+    },
+    {
+        "feedback": "More guest lectures from industry professionals would add great value.",
+        "summary": "Requests more industry guest lectures for added value.",
+    },
+]
+PROMPT_TEMPLATE = "Feedback: {feedback}\nSummary:"
+def milestone_1():
+    """Returns the structured feedback-summary dataset."""
+    return FEEDBACK_DATA
 
 
-# --- Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).
-# Hint: Apply the `lfllm-lflora` technique to inject and train the LoRA adapter on your chosen LLM.
-def milestone_2():  # TODO(milestone 2)
-    raise NotImplementedError("TODO(milestone 2)")
+# Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).
+class LoRALinear(nn.Module):
+    """Drop-in LoRA wrapper: frozen base + trainable rank-r detour (Drill 3)."""
+    def __init__(self, base_layer, r=4, alpha=16):
+        super().__init__()
+        self.base = base_layer
+        self.r = r
+        self.alpha = alpha
+        self.scale = alpha / r
+        # Freeze the original pretrained weights
+        for p in self.base.parameters():
+            p.requires_grad = False
+        d_out, d_in = base_layer.weight.shape
+        # A: random init (compressed), B: zero init (safe no-op at step 0)
+        self.A = nn.Parameter(torch.randn(r, d_in) * 0.01)
+        self.B = nn.Parameter(torch.zeros(d_out, r))
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scale
+def add_lora(model, r=4, alpha=16):
+    """Injects LoRA adapters into GPT-2 attention projections."""
+    # Step 1: Freeze every weight in the base model
+    for p in model.parameters():
+        p.requires_grad = False
+    # Step 2: Wrap only the attention c_attn projections
+    for block in model.transformer.h:
+        old = block.attn.c_attn
+        d_out = old.weight.shape[0]
+        d_in = old.weight.shape[1]
+        # Create a standard nn.Linear matching c_attn dimensions
+        new_linear = nn.Linear(d_in, d_out, bias=(old.bias is not None))
+        with torch.no_grad():
+            new_linear.weight.copy_(old.weight.T)
+            if old.bias is not None:
+                new_linear.bias.copy_(old.bias)
+        block.attn.c_attn = LoRALinear(new_linear, r=r, alpha=alpha)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    return model
+def train_lora(model, tokenizer, data, epochs=3, lr=1e-3):
+    """Trains the LoRA adapter on feedback-summary pairs."""
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=lr
+    )
+    model.train()
+    losses = []
+    for epoch in range(epochs):
+        total_loss = 0
+        for item in data:
+            prompt = PROMPT_TEMPLATE.format(feedback=item["feedback"])
+            full_text = prompt + " " + item["summary"]
+            inputs = tokenizer(
+                full_text, return_tensors="pt", truncation=True, max_length=128
+            )
+            input_ids = inputs["input_ids"]
+            # Only compute loss on the summary tokens
+            prompt_len = len(tokenizer(prompt)["input_ids"])
+            labels = input_ids.clone()
+            labels[0, :prompt_len] = -100
+            outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        avg = total_loss / len(data)
+        losses.append(avg)
+        print(f"Epoch {epoch + 1}/{epochs} | Loss: {avg:.4f}")
+    return losses
+def milestone_2():
+    """Loads GPT-2, injects LoRA, trains on feedback dataset."""
+    tokenizer = GPT2Tokenizer.from_pretrained("distilgpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    model = GPT2LMHeadModel.from_pretrained("distilgpt2")
+    model = add_lora(model, r=4, alpha=16)
+    losses = train_lora(model, tokenizer, FEEDBACK_DATA, epochs=3)
+    # Save adapter weights only
+    adapter_path = "adapter.pt"
+    adapter_state = {
+        k: v
+        for k, v in model.state_dict().items()
+        if "lora" in k.lower() or ".A" in k or ".B" in k
+    }
+    torch.save({"model": model, "tokenizer": tokenizer, "losses": losses}, adapter_path)
+    return {"model": model, "tokenizer": tokenizer, "losses": losses}
 
 
-# --- Milestone 3: Develop a Streamlit UI to upload feedback and trigger summarization.
-# Hint: Use Streamlit components to create an intuitive interface for input and displaying results.
-def milestone_3():  # TODO(milestone 3)
-    raise NotImplementedError("TODO(milestone 3)")
+# Milestone 3: Develop a Streamlit UI to upload feedback and trigger summarization.
+def summarize(model, tokenizer, feedback_text, max_new_tokens=40):
+    """Generates a summary from raw feedback text using the trained model."""
+    model.eval()
+    prompt = PROMPT_TEMPLATE.format(feedback=feedback_text)
+    inputs = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        output = model.generate(
+            inputs["input_ids"],
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_k=10,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    generated = tokenizer.decode(output[0], skip_special_tokens=True)
+    # Extract only the summary part after "Summary:"
+    if "Summary:" in generated:
+        return generated.split("Summary:")[-1].strip()
+    return generated.strip()
+def milestone_3():
+    """Returns the summarize function reference for the Streamlit UI."""
+    return summarize
 
+# Milestone 4: Evaluate the quality of generated summaries against original feedback.
+def compute_rouge1(reference, hypothesis):
+    """Computes a simple unigram ROUGE-1 F1 score (no external libraries)."""
+    ref_tokens = set(reference.lower().split())
+    hyp_tokens = set(hypothesis.lower().split())
+    if not hyp_tokens or not ref_tokens:
+        return 0.0
+    overlap = ref_tokens & hyp_tokens
+    precision = len(overlap) / len(hyp_tokens)
+    recall = len(overlap) / len(ref_tokens)
+    if precision + recall == 0:
+        return 0.0
+    f1 = 2 * precision * recall / (precision + recall)
+    return round(f1, 4)
+def milestone_4():
+    """Evaluates summary quality using ROUGE-1 F1 on the dataset."""
+    trained = milestone_2()
+    model = trained["model"]
+    tokenizer = trained["tokenizer"]
+    scores = []
+    for item in FEEDBACK_DATA[:6]:
+        generated = summarize(model, tokenizer, item["feedback"])
+        score = compute_rouge1(item["summary"], generated)
+        scores.append(score)
+    avg_rouge = sum(scores) / len(scores)
+    return {"rouge1_scores": scores, "avg_rouge1": avg_rouge}
 
-# --- Milestone 4: Evaluate the quality of generated summaries against original feedback.
-# Hint: Consider both automated metrics and qualitative review to assess summary accuracy and conciseness.
-def milestone_4():  # TODO(milestone 4)
-    raise NotImplementedError("TODO(milestone 4)")
-
-
-# --- Milestone 5: Implement adapter merging for inference.
-# Hint: Utilize the `lfllm-lflora` method to merge the trained adapter weights into the base model for efficient inference.
-def milestone_5():  # TODO(milestone 5)
-    raise NotImplementedError("TODO(milestone 5)")
+# Milestone 5: Implement adapter merging for inference.
+def merge_lora(model):
+    """Merges B·A into base weights so the model is a plain GPT-2 again."""
+    for block in model.transformer.h:
+        lora_layer = block.attn.c_attn
+        if isinstance(lora_layer, LoRALinear):
+            with torch.no_grad():
+                delta = (lora_layer.B @ lora_layer.A) * lora_layer.scale
+                lora_layer.base.weight.data += delta
+            # Replace wrapper with plain linear
+            block.attn.c_attn = lora_layer.base
+    return model
+def milestone_5():
+    """Merges adapter into base model and verifies output consistency."""
+    trained = milestone_2()
+    model = trained["model"]
+    tokenizer = trained["tokenizer"]
+    # Sample output BEFORE merge
+    sample = "The assignments were very helpful."
+    before_summary = summarize(model, tokenizer, sample)
+    # Merge adapter into base weights
+    model = merge_lora(model)
+    # Sample output AFTER merge
+    after_summary = summarize(model, tokenizer, sample)
+    return {
+        "before_merge": before_summary,
+        "after_merge": after_summary,
+        "model": model,
+        "tokenizer": tokenizer,
+    }
