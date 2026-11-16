@@ -207,3 +207,32 @@ def milestone_4():
     return {"rouge1_scores": scores, "avg_rouge1": avg_rouge}
 
 # Milestone 5: Implement adapter merging for inference.
+def merge_lora(model):
+    """Merges B·A into base weights so the model is a plain GPT-2 again."""
+    for block in model.transformer.h:
+        lora_layer = block.attn.c_attn
+        if isinstance(lora_layer, LoRALinear):
+            with torch.no_grad():
+                delta = (lora_layer.B @ lora_layer.A) * lora_layer.scale
+                lora_layer.base.weight.data += delta
+            # Replace wrapper with plain linear
+            block.attn.c_attn = lora_layer.base
+    return model
+def milestone_5():
+    """Merges adapter into base model and verifies output consistency."""
+    trained = milestone_2()
+    model = trained["model"]
+    tokenizer = trained["tokenizer"]
+    # Sample output BEFORE merge
+    sample = "The assignments were very helpful."
+    before_summary = summarize(model, tokenizer, sample)
+    # Merge adapter into base weights
+    model = merge_lora(model)
+    # Sample output AFTER merge
+    after_summary = summarize(model, tokenizer, sample)
+    return {
+        "before_merge": before_summary,
+        "after_merge": after_summary,
+        "model": model,
+        "tokenizer": tokenizer,
+    }
