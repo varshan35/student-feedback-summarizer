@@ -69,16 +69,6 @@ def milestone_1():
 
 
 # Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).
-
-
-
-# Milestone 3: Develop a Streamlit UI to upload feedback and trigger summarization.
-
-
-# Milestone 4: Evaluate the quality of generated summaries against original feedback.
-
-
-# Milestone 5: Implement adapter merging for inference.
 class LoRALinear(nn.Module):
     """Drop-in LoRA wrapper: frozen base + trainable rank-r detour (Drill 3)."""
     def __init__(self, base_layer, r=4, alpha=16):
@@ -163,3 +153,33 @@ def milestone_2():
     }
     torch.save({"model": model, "tokenizer": tokenizer, "losses": losses}, adapter_path)
     return {"model": model, "tokenizer": tokenizer, "losses": losses}
+
+
+# Milestone 3: Develop a Streamlit UI to upload feedback and trigger summarization.
+def summarize(model, tokenizer, feedback_text, max_new_tokens=40):
+    """Generates a summary from raw feedback text using the trained model."""
+    model.eval()
+    prompt = PROMPT_TEMPLATE.format(feedback=feedback_text)
+    inputs = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        output = model.generate(
+            inputs["input_ids"],
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_k=10,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    generated = tokenizer.decode(output[0], skip_special_tokens=True)
+    # Extract only the summary part after "Summary:"
+    if "Summary:" in generated:
+        return generated.split("Summary:")[-1].strip()
+    return generated.strip()
+def milestone_3():
+    """Returns the summarize function reference for the Streamlit UI."""
+    return summarize
+
+# Milestone 4: Evaluate the quality of generated summaries against original feedback.
+
+
+# Milestone 5: Implement adapter merging for inference.
