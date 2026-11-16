@@ -365,3 +365,7 @@ def milestone_5(trained=None):
         "model": model,
         "tokenizer": tokenizer,
     }
+def baseline_first_sentence(feedback_text):
+    """Baseline: just returns the first sentence as the 'summary'."""
+    sentences = feedback_text.replace(".", ".\n").split("\n")
+    return sentences[0].strip() if sentences else feedback_text
