@@ -94,8 +94,9 @@ def inject_lora(model, r=4, alpha=16):
 
     for block in model.transformer.h:
         old = block.attn.c_attn
-        d_out = old.weight.shape[0]
-        d_in = old.weight.shape[1]
+        # In GPT-2 Conv1D: old.weight.shape is [d_in, d_out] = [768, 2304]
+        d_in = old.weight.shape[0]   # 768
+        d_out = old.weight.shape[1]  # 2304
 
         new_linear = nn.Linear(d_in, d_out, bias=(old.bias is not None))
         with torch.no_grad():
